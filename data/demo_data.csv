@@ -1,0 +1,10 @@
+title,authors,journal,doi,year
+"Nanometre-scale thermometry in a living cell","G. Kucsko, P. C. Maurer",Nature,10.1038/nature12373,2013
+"Deep Learning in Medical Image Analysis","S. Kevin Zhou, Hayit Greenspan, Dinggang Shen",Springer,10.1007/978-3-319-42999-1,2017
+"Attention Is All You Need","Ashish Vaswani, Noam Shazeer",NIPS,,2017
+"Deep Residual Learning for Image Recognition","Kaiming He, Xiangyu Zhang, Shaoqing Ren",CVPR,,2016
+"A Novel Quantum Computing Approach for Solving NP-Complete Problems in Linear Time",Fictitious Author,,10.9999/fake.paper.2024,2024
+"The Role of Artificial Intelligence in Predicting Stock Market Crashes with 100% Accuracy",,,10.1234/nonexistent.journal.5678,2025
+"Generative Adversarial Networks","Ian Goodfellow, Jean Pouget-Abadie",NIPS,,2014
+"BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding","Jacob Devlin, Ming-Wei Chang",NAACL,10.18653/v1/N19-1423,2019
+"A Critical Review of Recent Advances in Deep Learning for Natural Language Processing",,,,2023

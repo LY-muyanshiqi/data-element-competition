@@ -16,7 +16,7 @@ st.caption("基于 CrossRef / OpenAlex 公开 API + 规则引擎，自动识别 
 
 # ── Tab 1: 单篇验证 ────────────────────────────────────────────────
 
-tab1, tab2 = st.tabs(["🔍 单篇验证", "📂 批量验证"])
+tab1, tab2, tab3 = st.tabs(["🔍 单篇验证", "📂 批量验证", "📄 中文文献验证"])
 
 with tab1:
     col1, col2 = st.columns(2)
@@ -143,3 +143,55 @@ with tab2:
             # 导出
             csv = result_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button("📥 导出验证结果 (CSV)", csv, "verification_results.csv", "text/csv")
+
+# ── Tab 3: 中文文献验证 ────────────────────────────────────────────
+
+with tab3:
+    from verify_engine import parse_references_batch
+
+    st.markdown("#### 粘贴知网/万方引用格式，自动解析并验证")
+    st.caption("支持格式：[1]作者.标题[J].期刊名,2022,(7):156-159.")
+
+    raw_text = st.text_area(
+        "粘贴引用文本（每行一条）", height=200,
+        placeholder="[1]张三,李四.基于深度学习的洪水预测模型研究[J].水利学报,2022,53(6):156-169.\n[2]王五.人工智能在气象预测中的应用[D].北京大学,2023.",
+    )
+
+    if st.button("解析并验证", type="primary", key="btn_cn", disabled=not raw_text.strip()):
+        parsed = parse_references_batch(raw_text)
+        records = []
+        for p in parsed:
+            records.append(ReferenceRecord(
+                title=p.get("title", "") or "",
+                authors="",
+                doi=None,
+                year=p.get("year"),
+            ))
+
+        st.info(f"解析出 {len(records)} 条文献")
+
+        results_data = []
+        with st.spinner(f"正在验证 {len(records)} 条..."):
+            for i, rec in enumerate(records):
+                r = verify_record(rec)
+                results_data.append({
+                    "序号": i + 1,
+                    "标题": rec.title,
+                    "年份": rec.year or "",
+                    "状态": r.status,
+                    "可信度": r.score,
+                    "验证详情": "\n".join(r.details),
+                })
+
+        result_df = pd.DataFrame(results_data)
+
+        status_counts = result_df["状态"].value_counts()
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("✅ 可靠", status_counts.get("可靠", 0))
+        col_b.metric("⚠️ 可疑", status_counts.get("可疑", 0))
+        col_c.metric("❌ 虚假", status_counts.get("虚假", 0))
+
+        st.dataframe(result_df, use_container_width=True)
+
+        csv = result_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("📥 导出结果 (CSV)", csv, "cn_literature_results.csv", "text/csv")

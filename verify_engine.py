@@ -168,8 +168,8 @@ def _try_openalex_doi(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
     return None
 
 
-def _try_crossref_title(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
-    """尝试 CrossRef 标题搜索"""
+def _try_crossref_title(ref: ReferenceRecord, doi_failed: bool = False) -> tuple[int, str, dict] | None:
+    """尝试 CrossRef 标题搜索。doi_failed=True 时降低得分（DOI查不到说明可疑）"""
     try:
         resp = requests.get(
             "https://api.crossref.org/works",
@@ -183,7 +183,9 @@ def _try_crossref_title(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
                 best_title = best.get("title", [""])[0]
                 sim = _title_similarity(ref.title, best_title)
                 if sim > 0.7:
-                    return 20, f"CrossRef标题搜索匹配（相似度{sim:.2f}）", {
+                    score = 20 if not doi_failed else 10
+                    detail = f"CrossRef标题搜索匹配（相似度{sim:.2f}）" + (" [DOI查不到，降权]" if doi_failed else "")
+                    return score, detail, {
                         "crossref": {
                             "backend": "crossref_title",
                             "title": best.get("title"),
@@ -279,7 +281,10 @@ def _cascade_verify(ref: ReferenceRecord) -> tuple[int, str, dict]:
     combined_raw: dict = {}
 
     # Stage 1: DOI 级联
+    doi_stage_tried = False
+    doi_stage_failed = False
     if ref.doi:
+        doi_stage_tried = True
         # 1a. CrossRef DOI
         result = _try_crossref_doi(ref)
         if result and result[0] >= 30:
@@ -296,10 +301,12 @@ def _cascade_verify(ref: ReferenceRecord) -> tuple[int, str, dict]:
         if result:
             combined_raw.update(result[2])
 
+        doi_stage_failed = True  # DOI有但两个都没确认
+
     # Stage 2: 标题搜索级联
     # 2a. CrossRef 标题
-    result = _try_crossref_title(ref)
-    if result and result[0] >= 20:
+    result = _try_crossref_title(ref, doi_failed=doi_stage_failed)
+    if result and result[0] >= (20 if not doi_stage_failed else 10):
         combined_raw.update(result[2])
         return result[0], result[1], combined_raw
     if result:
@@ -332,13 +339,38 @@ def _check_doi_format(doi: Optional[str]) -> tuple[int, str]:
     return 0, "DOI格式无效"
 
 
+def _check_doi_validity(ref: ReferenceRecord, raw: dict, cascade_score: int) -> tuple[int, str]:
+    """DOI格式有效但API查不到 = 强烈造假信号"""
+    if not ref.doi or not DOI_REGEX.match(ref.doi.strip()):
+        return 5, "无有效DOI（跳过）"
+
+    # 检查是否有DOI级的匹配（不是标题搜索）
+    has_doi_match = False
+    for api_key in ["crossref", "openalex", "semantic_scholar"]:
+        api_data = raw.get(api_key, {})
+        backend = api_data.get("backend", "")
+        if "doi" in backend and "error" not in api_data:
+            has_doi_match = True
+            break
+
+    if has_doi_match:
+        return 5, "DOI已验证存在"
+
+    # DOI查不到：检查是否标题搜索找到了（可疑）
+    has_title_match = cascade_score >= 15
+    if has_title_match:
+        return -3, "DOI无记录但标题搜到相似文献（可能为嵌合体引用）"
+
+    return -8, "DOI格式正确但所有数据源均无记录"
+
+
 def _check_author_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
     if not ref.authors:
-        return 10, "作者未提供（跳过校验）"
+        return 0, "作者未提供（无法校验）"
 
     input_authors = [a.strip().lower() for a in ref.authors.split(',') if a.strip()]
     if not input_authors:
-        return 10, "作者未提供（跳过校验）"
+        return 0, "作者未提供（无法校验）"
 
     for api_key in ["crossref", "openalex", "semantic_scholar"]:
         api_data = raw.get(api_key, {})
@@ -383,12 +415,12 @@ def _check_author_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
         else:
             return 0, f"作者不匹配（输入{len(input_authors)}人，无一命中API记录）"
 
-    return 10, "无API作者数据（跳过校验）"
+    return 0, "无API作者数据（无法校验）"
 
 
 def _check_journal_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
     if not ref.journal:
-        return 5, "期刊未提供（跳过校验）"
+        return 0, "期刊未提供（无法校验）"
 
     for api_key in ["crossref", "openalex", "semantic_scholar"]:
         api_data = raw.get(api_key, {})
@@ -411,7 +443,7 @@ def _check_journal_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
             else:
                 return 0, f"期刊名不匹配（输入「{ref.journal}」vs API「{api_journal[:40]}」）"
 
-    return 5, "无API期刊数据（跳过校验）"
+    return 0, "无API期刊数据（无法校验）"
 
 
 def _check_metadata_consistency(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
@@ -499,11 +531,16 @@ def verify_record(ref: ReferenceRecord) -> VerificationResult:
     details.append(f"[乱码检测] {d2} (+{s2})")
     details.append(f"[年份] {d3} (+{s3})")
 
-    # 维度3: 级联验证 (最多30分)
+    # 维度3: 级联验证
     s, d, cascade_raw = _cascade_verify(ref)
     total += s
     details.append(f"[数据源] {d} (+{s})")
     raw.update(cascade_raw)
+
+    # 维度3b: DOI真实性 (DOI格式对但查不到=强烈造假信号)
+    s_doi_val, d_doi_val = _check_doi_validity(ref, raw, s)
+    total += s_doi_val
+    details.append(f"[DOI真实性] {d_doi_val} ({'+' if s_doi_val>=0 else ''}{s_doi_val})")
 
     api_confirmed = s >= 20  # 至少标题搜索匹配
 

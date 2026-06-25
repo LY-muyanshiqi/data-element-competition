@@ -73,7 +73,7 @@ def _check_doi_format(doi: Optional[str]) -> tuple[int, str]:
     if not doi:
         return 0, "DOI缺失"
     if DOI_REGEX.match(doi.strip()):
-        return 10, "DOI格式有效"
+        return 8, "DOI格式有效"
     return 0, "DOI格式无效"
 
 
@@ -97,8 +97,14 @@ def _check_crossref(ref: ReferenceRecord) -> tuple[int, str, dict]:
             if resp.status_code == 200:
                 data = resp.json()
                 msg = data.get("message", {})
-                raw["crossref"] = {"source": "doi", "title": msg.get("title"), "doi": msg.get("DOI")}
-                return 40, "CrossRef DOI匹配成功", raw
+                raw["crossref"] = {
+                    "source": "doi",
+                    "title": msg.get("title"),
+                    "doi": msg.get("DOI"),
+                    "author": msg.get("author", []),
+                    "container-title": msg.get("container-title", []),
+                }
+                return 30, "CrossRef DOI匹配成功", raw
             elif resp.status_code == 404:
                 raw["crossref"] = {"source": "doi", "error": "DOI未找到"}
             else:
@@ -121,7 +127,14 @@ def _check_crossref(ref: ReferenceRecord) -> tuple[int, str, dict]:
                 best_sim = _title_similarity(ref.title, items[0].get("title", [""])[0])
                 if best_sim > 0.7:
                     msg = items[0]
-                    return 25, f"CrossRef标题搜索匹配（相似度{best_sim:.2f}）", raw
+                    raw["crossref"] = {
+                        "source": "title_search",
+                        "title": msg.get("title"),
+                        "author": msg.get("author", []),
+                        "container-title": msg.get("container-title", []),
+                        "doi": msg.get("DOI"),
+                    }
+                    return 20, f"CrossRef标题搜索匹配（相似度{best_sim:.2f}）", raw
                 return 0, f"CrossRef标题搜索结果不匹配（最高相似度{best_sim:.2f}）", raw
             return 0, "CrossRef标题搜索无结果", raw
     except requests.RequestException as e:
@@ -179,11 +192,11 @@ def _openalex_confirm(data: dict, ref: ReferenceRecord, raw: dict) -> tuple[int,
         # 检查年份一致性
         oa_year = data.get("publication_year")
         if ref.year and oa_year and ref.year != oa_year:
-            return 15, f"OpenAlex确认存在但年份不一致（输入{ref.year} vs API{oa_year}）", raw
-        return 30, "OpenAlex确认文献存在", raw
+            return 12, f"OpenAlex确认存在但年份不一致（输入{ref.year} vs API{oa_year}）", raw
+        return 25, "OpenAlex确认文献存在", raw
     if sim > 0.7:
-        return 15, f"OpenAlex找到但标题不完全匹配（相似度{sim:.2f}）", raw
-    return 15, "OpenAlex文献存在", raw
+        return 12, f"OpenAlex找到但标题不完全匹配（相似度{sim:.2f}）", raw
+    return 12, "OpenAlex文献存在", raw
 
 
 def _check_metadata_consistency(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
@@ -197,7 +210,110 @@ def _check_metadata_consistency(ref: ReferenceRecord, raw: dict) -> tuple[int, s
             sim = _title_similarity(ref.title, api_title)
             if sim < 0.7:
                 return 0, f"标题与{field_name}记录不一致（相似度{sim:.2f}）"
-    return 10, "元数据一致性检查通过"
+    return 5, "元数据一致性检查通过"
+
+
+def _check_author_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
+    """检查输入作者是否出现在API返回数据中"""
+    if not ref.authors:
+        return 10, "作者未提供（跳过校验）"
+
+    input_authors = [a.strip().lower() for a in ref.authors.split(',') if a.strip()]
+    if not input_authors:
+        return 10, "作者未提供（跳过校验）"
+
+    for api_key in ["crossref", "openalex"]:
+        api_data = raw.get(api_key, {})
+        api_authors_raw = api_data.get("author", [])
+        if not api_authors_raw:
+            continue
+
+        api_author_names = set()
+        for a in api_authors_raw:
+            family = (a.get("family") or a.get("last") or "").lower()
+            given = (a.get("given") or a.get("first") or "").lower()
+            if family:
+                api_author_names.add(family)
+            if given:
+                api_author_names.add(given)
+
+        if not api_author_names:
+            continue
+
+        matched = 0
+        for input_a in input_authors:
+            for api_a in api_author_names:
+                if input_a in api_a or api_a in input_a:
+                    matched += 1
+                    break
+
+        match_rate = matched / len(input_authors)
+        if match_rate >= 0.5:
+            return 10, f"作者匹配通过（{matched}/{len(input_authors)}）"
+        elif match_rate > 0:
+            return 5, f"作者部分匹配（{matched}/{len(input_authors)}）"
+        else:
+            return 0, f"作者不匹配（输入{len(input_authors)}人，无一命中API记录）"
+
+    return 10, "无API作者数据（跳过校验）"
+
+
+# AI 生成文献的典型标题特征
+_AI_FINGERPRINT_PATTERNS = [
+    (re.compile(r'\b100%?\s*(accuracy|precision|recall|success)', re.IGNORECASE), "过度夸张声称（100% accuracy）"),
+    (re.compile(r'\bsolv(e[ds]?|ing)\s+(NP[- ]?(complete|hard|all|Problems)|all)\b', re.IGNORECASE), "声称解决NP完全/难问题"),
+    (re.compile(r'\b(always|never|perfect|infallible|flawless)\b', re.IGNORECASE), "绝对化词汇（always/never/perfect）"),
+    (re.compile(r'\bthe\s+(first|only)\b', re.IGNORECASE), "'the first/only' 宣称首创"),
+    (re.compile(r'\bnovel\s+(approach|method|framework|technique|Quantum)', re.IGNORECASE), "novel approach 模式（AI高频模板词）"),
+    (re.compile(r'\bcomprehensive\s+(review|survey|analysis|study)\s+of\b', re.IGNORECASE), "comprehensive review of 模式"),
+    (re.compile(r'\bin\s+(the\s+)?linear\s+time\b', re.IGNORECASE), "声称线性时间复杂度"),
+    (re.compile(r'\bstate[ -]of[ -]the[ -]art\b', re.IGNORECASE), "state-of-the-art 模板词"),
+]
+
+
+def _check_title_ai_fingerprints(title: str) -> tuple[int, str]:
+    """检测标题中AI生成文献的典型特征，匹配到扣分"""
+    if not title:
+        return 7, "标题为空（跳过检测）"
+
+    hits = []
+    for pattern, desc in _AI_FINGERPRINT_PATTERNS:
+        if pattern.search(title):
+            hits.append(desc)
+
+    if len(hits) >= 3:
+        return 0, f"AI标题特征多项命中：{'；'.join(hits[:3])}"
+    elif len(hits) >= 2:
+        return 3, f"AI标题特征部分命中：{'；'.join(hits)}"
+    elif len(hits) == 1:
+        return 5, f"AI标题特征单次命中：{hits[0]}"
+    else:
+        return 7, "未检测到AI标题特征"
+
+
+def _check_journal_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
+    """检查输入期刊名是否与API返回一致"""
+    if not ref.journal:
+        return 5, "期刊未提供（跳过校验）"
+
+    for api_key in ["crossref", "openalex"]:
+        api_data = raw.get(api_key, {})
+        api_journal = ""
+        ct = api_data.get("container-title", "")
+        if isinstance(ct, list) and ct:
+            api_journal = ct[0]
+        oa_journal = api_data.get("journal", "")
+        if oa_journal:
+            api_journal = api_journal or oa_journal
+
+        if api_journal:
+            sim = _title_similarity(ref.journal, api_journal)
+            if sim > 0.7:
+                return 5, f"期刊名匹配通过（相似度{sim:.2f}）"
+            else:
+                return 0, f"期刊名不匹配（输入「{ref.journal}」vs API「{api_journal[:40]}」）"
+
+    return 5, "无API期刊数据（跳过校验）"
 
 
 # ── main ────────────────────────────────────────────────────────────
@@ -206,17 +322,23 @@ def verify_record(ref: ReferenceRecord) -> VerificationResult:
     total, details = 0, []
     raw: dict = {}
 
-    # 维度1: DOI格式
+    lang = SemanticChecker.classify_language(ref.title)
+
+    # 维度1: DOI格式 (8分)
     s, d = _check_doi_format(ref.doi)
     total += s
     details.append(f"[DOI格式] {d} (+{s})")
 
-    # 维度2: 年份合理性
-    s, d = _check_year(ref.year)
-    total += s
-    details.append(f"[年份] {d} (+{s})")
+    # 维度2: 语义一致性 (10分) — 整合标题长度+乱码+年份
+    s1, d1 = SemanticChecker.check_title_length(ref.title)
+    s2, d2 = SemanticChecker.check_garbage_chars(ref.title)
+    s3, d3 = SemanticChecker.check_year_range(ref.year, lang)
+    total += s1 + s2 + s3
+    details.append(f"[标题长度] {d1} (+{s1})")
+    details.append(f"[乱码检测] {d2} (+{s2})")
+    details.append(f"[年份] {d3} (+{s3})")
 
-    # 维度3: CrossRef
+    # 维度3: CrossRef (30分)
     s, d, c_r = _check_crossref(ref)
     total += s
     details.append(f"[CrossRef] {d} (+{s})")
@@ -224,13 +346,28 @@ def verify_record(ref: ReferenceRecord) -> VerificationResult:
 
     time.sleep(0.5)  # rate limit
 
-    # 维度4: OpenAlex
+    # 维度4: OpenAlex (25分)
     s, d, o_r = _check_openalex(ref)
     total += s
     details.append(f"[OpenAlex] {d} (+{s})")
     raw.update(o_r)
 
-    # 维度5: 元数据一致性
+    # 维度5: 作者匹配 (10分)
+    s, d = _check_author_match(ref, raw)
+    total += s
+    details.append(f"[作者匹配] {d} (+{s})")
+
+    # 维度6: AI标题特征 (7分)
+    s, d = _check_title_ai_fingerprints(ref.title)
+    total += s
+    details.append(f"[AI特征] {d} (+{s})")
+
+    # 维度7: 期刊匹配 (5分)
+    s, d = _check_journal_match(ref, raw)
+    total += s
+    details.append(f"[期刊匹配] {d} (+{s})")
+
+    # 维度8: 元数据一致性 (5分)
     s, d = _check_metadata_consistency(ref, raw)
     total += s
     details.append(f"[一致性] {d} (+{s})")

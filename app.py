@@ -76,6 +76,11 @@ with tab1:
         with st.expander("API 原始数据"):
             st.json(result.raw_data)
 
+        if result.corrections:
+            st.markdown("**💡 修正建议：**")
+            for c in result.corrections:
+                st.markdown(f"- {c}")
+
 # ── Tab 2: 批量验证 ────────────────────────────────────────────────
 
 with tab2:
@@ -143,6 +148,15 @@ with tab2:
 
             csv = result_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button("📥 导出验证结果 (CSV)", csv, "verification_results.csv", "text/csv")
+
+            # PDF 报告
+            if st.button("📄 生成 PDF 报告"):
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    pdf_path = tmp.name
+                ve.generate_pdf_report(all_results, records, pdf_path)
+                with open(pdf_path, "rb") as f:
+                    st.download_button("📥 下载 PDF 报告", f, "verification_report.pdf", "application/pdf")
+                os.unlink(pdf_path)
 
 # ── Tab 3: 中文文献验证 ────────────────────────────────────────────
 

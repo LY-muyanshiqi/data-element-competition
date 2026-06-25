@@ -39,10 +39,11 @@ class ReferenceRecord:
 
 @dataclass
 class VerificationResult:
-    status: str   # 6档: "确定真实"|"高度可信"|"存疑-可能为真"|"存疑-可能为假"|"高度存疑"|"确定虚假"
+    status: str   # 6档
     score: int  # 0-100
     details: list = field(default_factory=list)
     raw_data: dict = field(default_factory=dict)
+    corrections: list = field(default_factory=list)
 
 
 # ── helpers ───────────────────────────────────────────────────────────
@@ -579,8 +580,50 @@ def verify_record(ref: ReferenceRecord) -> VerificationResult:
 
     score = max(0, min(100, total))
     status = _classify_6level(score)
+    corrections = _suggest_corrections(ref, raw)
 
-    return VerificationResult(status=status, score=score, details=details, raw_data=raw)
+    return VerificationResult(status=status, score=score, details=details, raw_data=raw, corrections=corrections)
+
+
+def _suggest_corrections(ref: ReferenceRecord, raw: dict) -> list[str]:
+    """生成元数据修正建议"""
+    suggestions = []
+
+    for api_key in ["crossref", "openalex", "semantic_scholar"]:
+        api_data = raw.get(api_key, {})
+        api_title = api_data.get("title", "")
+        if isinstance(api_title, list):
+            api_title = api_title[0] if api_title else ""
+
+        if api_title and _title_similarity(ref.title, api_title) > 0.7 and _title_similarity(ref.title, api_title) < 0.95:
+            suggestions.append(f"建议补充完整标题：{api_title}")
+
+        if not ref.doi:
+            api_doi = api_data.get("doi", "")
+            if api_doi:
+                suggestions.append(f"建议补充 DOI：{api_doi}")
+
+        api_year = api_data.get("publication_year")
+        if not api_year and api_key == "crossref":
+            api_year = _extract_year_from_crossref_data(api_data)
+        if ref.year and api_year and ref.year != api_year:
+            suggestions.append(f"年份可能为 {api_year}（输入为{ref.year}）")
+        elif not ref.year and api_year:
+            suggestions.append(f"建议补充年份：{api_year}")
+
+        if suggestions:
+            break  # 只从第一个有数据的API取建议
+
+    return suggestions[:5]  # 最多5条建议
+
+
+def _extract_year_from_crossref_data(msg: dict) -> Optional[int]:
+    for key in ("published-print", "published-online", "issued", "created"):
+        try:
+            return msg[key]["date-parts"][0][0]
+        except (KeyError, IndexError, TypeError):
+            continue
+    return None
 
 
 # ── 批量验证 ────────────────────────────────────────────────────────
@@ -820,3 +863,87 @@ def extract_references_from_bibtex(text: str) -> list[ReferenceRecord]:
         ))
 
     return records
+
+
+# ── PDF 验证报告生成 ────────────────────────────────────────────────
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import os as _os
+
+_STATUS_COLORS = {
+    "确定真实": colors.HexColor("#28a745"),
+    "高度可信": colors.HexColor("#5cb85c"),
+    "存疑-可能为真": colors.HexColor("#f0ad4e"),
+    "存疑-可能为假": colors.HexColor("#ffc107"),
+    "高度存疑": colors.HexColor("#dc3545"),
+    "确定虚假": colors.HexColor("#c9302c"),
+}
+
+
+def generate_pdf_report(results: list[VerificationResult], records: list[ReferenceRecord], output_path: str):
+    """生成 PDF 验证报告"""
+    doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=15*mm, bottomMargin=15*mm)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # 标题
+    title_style = ParagraphStyle('CTitle', parent=styles['Title'], fontSize=16, spaceAfter=6*mm)
+    elements.append(Paragraph("学术文献真实性验证报告", title_style))
+    elements.append(Paragraph(f"生成时间：{time.strftime('%Y-%m-%d %H:%M')}　|　共 {len(results)} 条文献", styles['Normal']))
+    elements.append(Spacer(1, 8*mm))
+
+    # 汇总统计
+    status_counts = {}
+    for r in results:
+        status_counts[r.status] = status_counts.get(r.status, 0) + 1
+
+    summary_data = [["状态", "数量", "占比"]]
+    for s in ["确定真实", "高度可信", "存疑-可能为真", "存疑-可能为假", "高度存疑", "确定虚假"]:
+        cnt = status_counts.get(s, 0)
+        pct = f"{cnt/len(results)*100:.1f}%" if results else "0%"
+        summary_data.append([s, str(cnt), pct])
+
+    summary_table = Table(summary_data, colWidths=[60*mm, 40*mm, 40*mm])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#343a40")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('FONTSIZE', (0, 1), (-1, -1), 9),
+        ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fa")]),
+    ]))
+    elements.append(summary_table)
+    elements.append(Spacer(1, 8*mm))
+
+    # 逐条详情
+    detail_style = ParagraphStyle('Detail', parent=styles['Normal'], fontSize=8, leading=11, spaceAfter=2*mm)
+    header_style = ParagraphStyle('Header', parent=styles['Normal'], fontSize=9, spaceAfter=1*mm, fontName='Helvetica-Bold')
+
+    for i, (ref, r) in enumerate(zip(records, results), 1):
+        color = _STATUS_COLORS.get(r.status, colors.grey)
+        elements.append(Paragraph(f"#{i}　<span color='{color}'>■ {r.status}</span>　可信度：{r.score}/100", header_style))
+        elements.append(Paragraph(f"<b>标题：</b>{ref.title}", detail_style))
+        if ref.authors:
+            elements.append(Paragraph(f"<b>作者：</b>{ref.authors}", detail_style))
+        if ref.doi:
+            elements.append(Paragraph(f"<b>DOI：</b>{ref.doi}", detail_style))
+        if ref.journal:
+            elements.append(Paragraph(f"<b>期刊：</b>{ref.journal}", detail_style))
+        if ref.year:
+            elements.append(Paragraph(f"<b>年份：</b>{ref.year}", detail_style))
+
+        for d in r.details:
+            elements.append(Paragraph(f"　{d}", detail_style))
+
+        elements.append(Spacer(1, 3*mm))
+
+    doc.build(elements)
+    return output_path

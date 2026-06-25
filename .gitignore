@@ -3,3 +3,8 @@ __pycache__/
 .vscode/
 screenshot*.png
 screenshot*.jpg
+*.pdf
+*.docx
+*.zip
+任务二/
+任务二_extracted/

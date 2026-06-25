@@ -1,9 +1,10 @@
-"""验证引擎单元测试"""
+"""验证引擎 v3 单元测试"""
 import pytest
 from verify_engine import (
     ReferenceRecord, VerificationResult, verify_record, verify_batch_concurrent,
     SemanticChecker, _check_doi_format, _check_title_ai_fingerprints,
-    _check_author_match, _check_journal_match, clear_cache,
+    _check_author_match, clear_cache, extract_references_from_bibtex,
+    _try_crossref_doi, _try_semantic_scholar, _cascade_verify,
 )
 
 
@@ -62,51 +63,79 @@ class TestTitleAIFingerprints:
         assert s <= 3
 
 
+class TestCascadeVerify:
+    def test_crossref_doi_real(self):
+        clear_cache()
+        ref = ReferenceRecord(title='Nanometre-scale thermometry in a living cell', authors='G. Kucsko', doi='10.1038/nature12373', year=2013)
+        score, msg, raw = _cascade_verify(ref)
+        assert score >= 30, f"Expected >=30, got {score}: {msg}"
+
+    def test_fake_doi_no_result(self):
+        clear_cache()
+        ref = ReferenceRecord(title='Fake Paper Not Real', authors='X', doi='10.9999/fake.9999', year=2025)
+        score, msg, raw = _cascade_verify(ref)
+        assert score <= 10, f"Expected <=10, got {score}"
+
+    def test_semantic_scholar_fallback(self):
+        clear_cache()
+        ref = ReferenceRecord(title='Deep Residual Learning for Image Recognition', authors='Kaiming He', year=2016)
+        score, msg, raw = _cascade_verify(ref)
+        assert score >= 0  # 至少不报错
+
+
 class TestVerifyRecord:
     def test_real_reference(self):
         clear_cache()
         ref = ReferenceRecord(
             title='Nanometre-scale thermometry in a living cell',
             authors='G. Kucsko, P. C. Maurer',
-            journal='Nature',
-            doi='10.1038/nature12373',
-            year=2013,
+            journal='Nature', doi='10.1038/nature12373', year=2013,
         )
         r = verify_record(ref)
-        assert r.status == '可靠'
+        assert r.status == '确定真实'
         assert r.score >= 80
 
     def test_fake_reference(self):
         clear_cache()
         ref = ReferenceRecord(
             title='A Novel Quantum Computing Approach for Solving NP-Complete Problems in Linear Time',
-            authors='Fictitious Author',
-            doi='10.9999/fake.paper.2024',
-            year=2024,
+            authors='Fictitious Author', doi='10.9999/fake.paper.2024', year=2024,
         )
         r = verify_record(ref)
         assert r.score < 40
 
     def test_no_doi_reference(self):
         clear_cache()
-        ref = ReferenceRecord(
-            title='Attention Is All You Need',
-            authors='Ashish Vaswani',
-            year=2017,
-        )
+        ref = ReferenceRecord(title='Attention Is All You Need', authors='Ashish Vaswani', year=2017)
         r = verify_record(ref)
-        assert r.score >= 0
+        assert r.score >= 40
 
 
 class TestBatchConcurrent:
     def test_batch_three(self):
         clear_cache()
         refs = [
-            ReferenceRecord(title='Deep Residual Learning for Image Recognition', authors='Kaiming He', year=2016),
-            ReferenceRecord(title='Fake Paper Title That Does Not Exist', authors='Fake', year=2025),
-            ReferenceRecord(title='BERT: Pre-training of Deep Bidirectional Transformers', authors='Jacob Devlin', year=2019),
+            ReferenceRecord(title='Deep Residual Learning', authors='Kaiming He', year=2016),
+            ReferenceRecord(title='Fake Paper Does Not Exist', authors='Fake', year=2025),
+            ReferenceRecord(title='BERT: Pre-training', authors='Jacob Devlin', year=2019),
         ]
         results = verify_batch_concurrent(refs, max_workers=3)
         assert len(results) == 3
         for r in results:
             assert isinstance(r, VerificationResult)
+
+
+class TestBibTeXExtraction:
+    def test_single_entry(self):
+        bib = """@article{test2020,
+            title={Deep Learning for Image Recognition},
+            author={Smith, John and Jones, Mary},
+            journal={Nature},
+            year={2020},
+            doi={10.1038/test.2020}
+        }"""
+        records = extract_references_from_bibtex(bib)
+        assert len(records) == 1
+        assert 'Deep Learning' in records[0].title
+        assert 'Smith' in records[0].authors
+        assert records[0].year == 2020

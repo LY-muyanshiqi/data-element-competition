@@ -1,22 +1,46 @@
-"""学术文献真实性验证工具 — Streamlit Web 界面"""
+"""学术文献真实性验证工具 — Streamlit Web 界面 v3"""
 
 from __future__ import annotations
 import io
-import time
+import os
+import tempfile
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-from verify_engine import ReferenceRecord, verify_record, verify_batch, verify_batch_concurrent
+from verify_engine import (
+    ReferenceRecord, verify_record, verify_batch, verify_batch_concurrent,
+    extract_references_from_pdf, extract_references_from_bibtex,
+)
 
 st.set_page_config(page_title="文献真实性验证", page_icon="📚", layout="wide")
-st.title("📚 学术文献真实性验证工具")
-st.caption("基于 CrossRef / OpenAlex 公开 API + 规则引擎，自动识别 AI 生成的虚假文献")
+st.title("📚 学术文献真实性验证工具 v3")
+st.caption("基于 CrossRef / OpenAlex / Semantic Scholar 公开 API + 级联验证引擎，自动识别 AI 生成的虚假文献")
+
+# 6档分类颜色映射
+COLOR_MAP = {
+    "确定真实": "green",
+    "高度可信": "green",
+    "存疑-可能为真": "orange",
+    "存疑-可能为假": "orange",
+    "高度存疑": "red",
+    "确定虚假": "red",
+}
+
+STATUS_ORDER = ["确定真实", "高度可信", "存疑-可能为真", "存疑-可能为假", "高度存疑", "确定虚假"]
+STATUS_DISPLAY = {
+    "确定真实": "🟢 确定真实",
+    "高度可信": "🟢 高度可信",
+    "存疑-可能为真": "🟠 存疑-可能为真",
+    "存疑-可能为假": "🟠 存疑-可能为假",
+    "高度存疑": "🔴 高度存疑",
+    "确定虚假": "🔴 确定虚假",
+}
 
 # ── Tab 1: 单篇验证 ────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(["🔍 单篇验证", "📂 批量验证", "📄 中文文献验证"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 单篇验证", "📂 批量验证", "📄 中文文献验证", "📁 文件导入"])
 
 with tab1:
     col1, col2 = st.columns(2)
@@ -37,24 +61,19 @@ with tab1:
             year=year if year else None,
         )
 
-        with st.spinner("正在验证..."):
+        with st.spinner("正在级联验证（CrossRef → OpenAlex → Semantic Scholar）..."):
             result = verify_record(ref)
 
-        # 状态卡片
-        color_map = {"可靠": "green", "可疑": "orange", "虚假": "red"}
         st.markdown(
-            f"### 验证结果: :{color_map[result.status]}[{result.status}] — 可信度 {result.score}/100"
+            f"### 验证结果: :{COLOR_MAP.get(result.status, 'gray')}[{result.status}] — 可信度 {result.score}/100"
         )
 
-        # 进度条
         st.progress(result.score / 100, text=f"{result.score} 分")
 
-        # 详情列表
         st.markdown("**验证详情：**")
         for d in result.details:
             st.markdown(f"- {d}")
 
-        # API 原始数据
         with st.expander("API 原始数据"):
             st.json(result.raw_data)
 
@@ -63,16 +82,9 @@ with tab1:
 with tab2:
     st.markdown("#### 上传 CSV 文件进行批量验证")
 
-    template_df = pd.DataFrame(
-        columns=["title", "authors", "journal", "doi", "year"],
-    )
+    template_df = pd.DataFrame(columns=["title", "authors", "journal", "doi", "year"])
     template_csv = template_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 下载 CSV 模板",
-        template_csv,
-        "batch_template.csv",
-        "text/csv",
-    )
+    st.download_button("📥 下载 CSV 模板", template_csv, "batch_template.csv", "text/csv")
 
     uploaded = st.file_uploader("选择 CSV 文件（需包含 title 列）", type="csv")
 
@@ -84,63 +96,53 @@ with tab2:
         if st.button("开始批量验证", type="primary"):
             records = []
             for _, row in df.iterrows():
-                records.append(
-                    ReferenceRecord(
-                        title=str(row.get("title", "")),
-                        authors=str(row.get("authors", "")),
-                        journal=str(row.get("journal", "")) if pd.notna(row.get("journal")) else None,
-                        doi=str(row.get("doi", "")) if pd.notna(row.get("doi")) else None,
-                        year=int(row["year"]) if pd.notna(row.get("year")) else None,
-                    )
-                )
-
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+                records.append(ReferenceRecord(
+                    title=str(row.get("title", "")),
+                    authors=str(row.get("authors", "")),
+                    journal=str(row.get("journal", "")) if pd.notna(row.get("journal")) else None,
+                    doi=str(row.get("doi", "")) if pd.notna(row.get("doi")) else None,
+                    year=int(row["year"]) if pd.notna(row.get("year")) else None,
+                ))
 
             results_data = []
-            with st.spinner(f"正在并发验证 {len(records)} 条记录..."):
-                status_text.text(f"并发验证中（3线程）...")
+            with st.spinner(f"正在并发验证 {len(records)} 条记录（3线程）..."):
                 all_results = verify_batch_concurrent(records, max_workers=3)
                 for ref, r in zip(records, all_results):
-                    results_data.append(
-                        {
-                            "标题": ref.title,
-                            "作者": ref.authors,
-                            "期刊": ref.journal or "",
-                            "DOI": ref.doi or "",
-                            "输入年份": ref.year or "",
-                            "状态": r.status,
-                            "可信度": r.score,
-                            "验证详情": "\n".join(r.details),
-                        }
-                    )
-            progress_bar.progress(1.0)
+                    results_data.append({
+                        "标题": ref.title, "作者": ref.authors,
+                        "期刊": ref.journal or "", "DOI": ref.doi or "",
+                        "输入年份": ref.year or "",
+                        "状态": r.status, "可信度": r.score,
+                        "验证详情": "\n".join(r.details),
+                    })
 
             result_df = pd.DataFrame(results_data)
             st.success(f"验证完成！共 {len(result_df)} 条记录")
 
-            # 汇总统计
-            col_a, col_b, col_c = st.columns(3)
-            status_counts = result_df["状态"].value_counts()
-            col_a.metric("✅ 可靠", status_counts.get("可靠", 0))
-            col_b.metric("⚠️ 可疑", status_counts.get("可疑", 0))
-            col_c.metric("❌ 虚假", status_counts.get("虚假", 0))
+            # 6档统计
+            st.markdown("**6档分类统计：**")
+            cols = st.columns(6)
+            for i, status in enumerate(STATUS_ORDER):
+                count = int((result_df["状态"] == status).sum())
+                cols[i].metric(STATUS_DISPLAY[status], count)
 
-            # 图表
             fig = px.pie(
                 result_df, names="状态", color="状态",
-                color_discrete_map={"可靠": "#28a745", "可疑": "#ffc107", "虚假": "#dc3545"},
-                title="验证结果分布",
+                category_orders={"状态": STATUS_ORDER},
+                color_discrete_map={
+                    "确定真实": "#28a745", "高度可信": "#5cb85c",
+                    "存疑-可能为真": "#f0ad4e", "存疑-可能为假": "#ffc107",
+                    "高度存疑": "#dc3545", "确定虚假": "#c9302c",
+                },
+                title="验证结果分布（6档）",
             )
             st.plotly_chart(fig)
 
             fig2 = px.histogram(result_df, x="可信度", nbins=20, title="可信度分布")
             st.plotly_chart(fig2)
 
-            # 结果表格
             st.dataframe(result_df, use_container_width=True)
 
-            # 导出
             csv = result_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button("📥 导出验证结果 (CSV)", csv, "verification_results.csv", "text/csv")
 
@@ -162,10 +164,7 @@ with tab3:
         records = []
         for p in parsed:
             records.append(ReferenceRecord(
-                title=p.get("title", "") or "",
-                authors="",
-                doi=None,
-                year=p.get("year"),
+                title=p.get("title", "") or "", authors="", doi=None, year=p.get("year"),
             ))
 
         st.info(f"解析出 {len(records)} 条文献")
@@ -175,23 +174,95 @@ with tab3:
             for i, rec in enumerate(records):
                 r = verify_record(rec)
                 results_data.append({
-                    "序号": i + 1,
-                    "标题": rec.title,
-                    "年份": rec.year or "",
-                    "状态": r.status,
-                    "可信度": r.score,
+                    "序号": i + 1, "标题": rec.title, "年份": rec.year or "",
+                    "状态": r.status, "可信度": r.score,
                     "验证详情": "\n".join(r.details),
                 })
 
         result_df = pd.DataFrame(results_data)
 
-        status_counts = result_df["状态"].value_counts()
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("✅ 可靠", status_counts.get("可靠", 0))
-        col_b.metric("⚠️ 可疑", status_counts.get("可疑", 0))
-        col_c.metric("❌ 虚假", status_counts.get("虚假", 0))
+        cols = st.columns(6)
+        for i, status in enumerate(STATUS_ORDER):
+            count = int((result_df["状态"] == status).sum())
+            cols[i].metric(STATUS_DISPLAY[status], count)
 
         st.dataframe(result_df, use_container_width=True)
 
         csv = result_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("📥 导出结果 (CSV)", csv, "cn_literature_results.csv", "text/csv")
+
+# ── Tab 4: 文件导入 ────────────────────────────────────────────────
+
+with tab4:
+    st.markdown("#### 上传 PDF 或 BibTeX 文件，自动提取并验证参考文献")
+
+    uploaded_file = st.file_uploader("选择文件", type=["pdf", "bib", "txt"])
+    file_type = st.radio("文件类型", ["自动检测", "PDF", "BibTeX"], horizontal=True)
+
+    if uploaded_file:
+        file_bytes = uploaded_file.read()
+        st.write(f"文件大小：**{len(file_bytes) / 1024:.1f} KB**")
+
+        if st.button("提取并验证", type="primary", key="btn_file"):
+            records = []
+
+            # 确定文件类型
+            fname = uploaded_file.name.lower()
+            is_bib = fname.endswith(".bib") or file_type == "BibTeX"
+            is_pdf = fname.endswith(".pdf") or file_type == "PDF"
+
+            with st.spinner("正在提取参考文献..."):
+                if is_bib:
+                    try:
+                        text = file_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = file_bytes.decode("latin-1")
+                    records = extract_references_from_bibtex(text)
+                    st.info(f"从 BibTeX 提取出 {len(records)} 条文献")
+                elif is_pdf:
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(file_bytes)
+                        tmp_path = tmp.name
+                    try:
+                        records = extract_references_from_pdf(tmp_path)
+                        st.info(f"从 PDF 提取出 {len(records)} 条文献")
+                    finally:
+                        os.unlink(tmp_path)
+                else:
+                    st.error("无法识别文件类型，请手动选择")
+
+            if records:
+                results_data = []
+                with st.spinner(f"正在级联验证 {len(records)} 条记录..."):
+                    all_results = verify_batch_concurrent(records, max_workers=3)
+                    for ref, r in zip(records, all_results):
+                        results_data.append({
+                            "标题": ref.title, "DOI": ref.doi or "",
+                            "年份": ref.year or "", "状态": r.status,
+                            "可信度": r.score, "验证详情": "\n".join(r.details),
+                        })
+
+                result_df = pd.DataFrame(results_data)
+                st.success(f"验证完成！共 {len(result_df)} 条记录")
+
+                cols = st.columns(6)
+                for i, status in enumerate(STATUS_ORDER):
+                    count = int((result_df["状态"] == status).sum())
+                    cols[i].metric(STATUS_DISPLAY[status], count)
+
+                fig = px.pie(
+                    result_df, names="状态", color="状态",
+                    category_orders={"状态": STATUS_ORDER},
+                    color_discrete_map={
+                        "确定真实": "#28a745", "高度可信": "#5cb85c",
+                        "存疑-可能为真": "#f0ad4e", "存疑-可能为假": "#ffc107",
+                        "高度存疑": "#dc3545", "确定虚假": "#c9302c",
+                    },
+                    title="验证结果分布（6档）",
+                )
+                st.plotly_chart(fig)
+
+                st.dataframe(result_df, use_container_width=True)
+
+                csv = result_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button("📥 导出结果 (CSV)", csv, "file_import_results.csv", "text/csv")

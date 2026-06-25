@@ -20,7 +20,9 @@ st.caption("基于 CrossRef / OpenAlex / Semantic Scholar 公开 API + 级联验
 # 侧边栏设置
 with st.sidebar:
     st.markdown("### ⚙️ 设置")
-    offline = st.checkbox("离线模式", value=False, help="仅使用本地缓存，不发起网络请求")
+    offline = st.checkbox("离线模式", value=False, help="仅使用本地缓存，不发起网络请求",
+                          on_change=lambda: ve.set_offline_mode(st.session_state.get("offline", False)),
+                          key="offline")
     if offline:
         ve.set_offline_mode(True)
         st.warning("已启用离线模式：仅使用本地缓存验证")

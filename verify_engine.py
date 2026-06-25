@@ -245,8 +245,8 @@ def _try_crossref_title(ref: ReferenceRecord, doi_failed: bool = False) -> tuple
                 best_title = best.get("title", [""])[0]
                 sim = _title_similarity(ref.title, best_title)
                 if sim > 0.7:
-                    score = 20 if not doi_failed else 10
-                    detail = f"CrossRef标题搜索匹配（相似度{sim:.2f}）" + (" [DOI查不到，降权]" if doi_failed else "")
+                    score = 20 if not doi_failed else 5
+                    detail = f"CrossRef标题搜索匹配（相似度{sim:.2f}）" + (" [DOI查不到，大幅降权]" if doi_failed else "")
                     return score, detail, {
                         "crossref": {
                             "backend": "crossref_title",
@@ -419,12 +419,12 @@ def _check_doi_validity(ref: ReferenceRecord, raw: dict, cascade_score: int) -> 
     if has_doi_match:
         return 5, "DOI已验证存在"
 
-    # DOI查不到：但如果任何标题搜索找到了（score>=15），可能是DOI格式变体
-    has_title_match = cascade_score >= 15
-    if has_title_match:
-        return 0, "DOI无直接记录但标题匹配到文献（可能为DOI格式变体）"
+    # DOI查不到但有标题匹配 — 强烈可疑
+    if cascade_score >= 10:
+        return -10, "DOI无记录仅标题匹配到相似文献（强烈造假信号）"
 
-    return -8, "DOI格式正确但所有数据源均无记录"
+    # DOI查不到且标题也搜不到 — 极强信号
+    return -15, "DOI格式正确但所有数据源均无记录"
 
 
 def _check_author_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
@@ -526,6 +526,12 @@ def _check_metadata_consistency(ref: ReferenceRecord, raw: dict) -> tuple[int, s
             sim = _title_similarity(ref.title, api_title)
             if sim < 0.7:
                 return 0, f"标题与API记录不一致（相似度{sim:.2f}）"
+    # 完全没有API数据时不给这5分
+    if not any(
+        raw.get(k, {}).get("title", "")
+        for k in ["crossref", "openalex", "semantic_scholar"]
+    ):
+        return 0, "无API数据（跳过一致性检查）"
     return 5, "元数据一致性检查通过"
 
 

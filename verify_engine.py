@@ -254,3 +254,134 @@ def verify_batch(records: list[ReferenceRecord]) -> list[VerificationResult]:
         if i < len(records) - 1:
             time.sleep(1)  # 1 req/s
     return results
+
+
+# ── SemanticChecker: 语义一致性检查（整合自任务二）────────────────────
+
+import string as _string
+
+
+class SemanticChecker:
+    """标题/年份语义一致性检查，支持中英文"""
+
+    TITLE_MIN_LEN_ZH = 5
+    TITLE_MAX_LEN_ZH = 300
+    TITLE_MIN_LEN_EN = 10
+    TITLE_MAX_LEN_EN = 500
+    YEAR_MIN_ZH = 1980
+    YEAR_MAX_ZH = 2026
+    YEAR_MIN_EN = 1900
+    YEAR_MAX_EN = 2026
+
+    _GARBAGE_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+    _ALL_SPECIAL_PATTERN = re.compile(r'^[^\w一-鿿]+$')
+    _REPEAT_PATTERN = re.compile(r'(.)\1{9,}')
+
+    @classmethod
+    def is_chinese_title(cls, title: str) -> bool:
+        if not title:
+            return False
+        chinese_chars = sum(1 for c in title if '一' <= c <= '鿿')
+        return chinese_chars > len(title) * 0.3
+
+    @classmethod
+    def classify_language(cls, title: str) -> str:
+        if not title:
+            return "en"
+        cjk = sum(1 for c in title if '一' <= c <= '鿿' or '぀' <= c <= 'ヿ')
+        if cjk > len(title) * 0.5:
+            return "zh"
+        if cjk > 0:
+            return "mixed"
+        return "en"
+
+    @classmethod
+    def check_title_length(cls, title: str) -> tuple[int, str]:
+        if not title or not title.strip():
+            return 0, "标题为空"
+        lang = cls.classify_language(title)
+        length = len(title.strip())
+        min_len = cls.TITLE_MIN_LEN_ZH if lang == "zh" else cls.TITLE_MIN_LEN_EN
+        max_len = cls.TITLE_MAX_LEN_ZH if lang == "zh" else cls.TITLE_MAX_LEN_EN
+        if length < min_len:
+            return 0, f"标题过短（{length}字，最小{min_len}）"
+        if length > max_len:
+            return 0, f"标题过长（{length}字，最大{max_len}）"
+        return 3, "标题长度合理"
+
+    @classmethod
+    def check_garbage_chars(cls, title: str) -> tuple[int, str]:
+        if not title or not title.strip():
+            return 0, "标题为空"
+        title = title.strip()
+        if cls._GARBAGE_PATTERN.search(title):
+            return 0, "标题包含不可打印字符"
+        if cls._ALL_SPECIAL_PATTERN.match(title):
+            return 0, "标题全由特殊符号组成"
+        if cls._REPEAT_PATTERN.search(title):
+            return 0, "标题包含连续重复字符"
+        normal = set(_string.ascii_letters + _string.digits + _string.whitespace)
+        abnormal = sum(
+            1 for c in title
+            if c not in normal
+            and not ('一' <= c <= '鿿')
+            and c not in '，。！？；：""''（）【】《》、…—·'
+        )
+        if len(title) > 0 and abnormal / len(title) > 0.5:
+            return 0, "标题中异常字符占比过高"
+        return 3, "标题无乱码"
+
+    @classmethod
+    def check_year_range(cls, year, lang: str = "en") -> tuple[int, str]:
+        if year is None:
+            return 4, "年份未提供（跳过校验）"
+        try:
+            year_int = int(year)
+        except (ValueError, TypeError):
+            return 0, f"年份格式无法解析：'{year}'"
+        min_y = cls.YEAR_MIN_ZH if lang == "zh" else cls.YEAR_MIN_EN
+        max_y = cls.YEAR_MAX_ZH if lang == "zh" else cls.YEAR_MAX_EN
+        if min_y <= year_int <= max_y:
+            return 4, f"年份在合理范围内（{year_int}）"
+        return 0, f"年份{year_int}超出合理范围({min_y}-{max_y})"
+
+
+# ── 知网/万方引用解析 ────────────────────────────────────────────────
+
+
+# 中文学术引用类型码
+_REF_TYPE_CODES = 'J|N|D|M|C|R|P'
+_TITLE_PATTERN = re.compile(r'([.。])\s*([^.。]+?)\s*\[(' + _REF_TYPE_CODES + r')\]')
+_YEAR_PATTERN = re.compile(r'(19\d{2}|20\d{2})')
+
+
+def parse_single_reference(text: str) -> dict:
+    """从单条知网引用文本中提取标题和年份"""
+    raw = text.strip()
+    title = None
+    year = None
+
+    matches = list(_TITLE_PATTERN.finditer(raw))
+    if matches:
+        title = matches[-1].group(2).strip()
+        after_type = raw[matches[-1].end():]
+    else:
+        after_type = raw
+
+    year_match = _YEAR_PATTERN.search(after_type)
+    if year_match:
+        year = int(year_match.group(1))
+
+    return {'title': title, 'year': year, 'raw': raw}
+
+
+def parse_references_batch(text: str) -> list:
+    """批量解析引用文本（每行一条），自动跳过空行"""
+    records = []
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        parsed = parse_single_reference(line)
+        records.append(parsed)
+    return records

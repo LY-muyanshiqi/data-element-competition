@@ -1,18 +1,17 @@
 """学术文献真实性验证工具 — Streamlit Web 界面 v3"""
 
 from __future__ import annotations
+import importlib
 import io
 import os
+import sys
 import tempfile
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-from verify_engine import (
-    ReferenceRecord, verify_record, verify_batch, verify_batch_concurrent,
-    extract_references_from_pdf, extract_references_from_bibtex,
-)
+import verify_engine as ve
 
 st.set_page_config(page_title="文献真实性验证", page_icon="📚", layout="wide")
 st.title("📚 学术文献真实性验证工具 v3")
@@ -53,7 +52,7 @@ with tab1:
     year = st.number_input("发表年份", min_value=0, max_value=2100, value=0, step=1)
 
     if st.button("开始验证", type="primary", disabled=not title.strip()):
-        ref = ReferenceRecord(
+        ref = ve.ReferenceRecord(
             title=title.strip(),
             authors=authors.strip(),
             journal=journal.strip() or None,
@@ -62,7 +61,7 @@ with tab1:
         )
 
         with st.spinner("正在级联验证（CrossRef → OpenAlex → Semantic Scholar）..."):
-            result = verify_record(ref)
+            result = ve.verify_record(ref)
 
         st.markdown(
             f"### 验证结果: :{COLOR_MAP.get(result.status, 'gray')}[{result.status}] — 可信度 {result.score}/100"
@@ -96,7 +95,7 @@ with tab2:
         if st.button("开始批量验证", type="primary"):
             records = []
             for _, row in df.iterrows():
-                records.append(ReferenceRecord(
+                records.append(ve.ReferenceRecord(
                     title=str(row.get("title", "")),
                     authors=str(row.get("authors", "")),
                     journal=str(row.get("journal", "")) if pd.notna(row.get("journal")) else None,
@@ -106,7 +105,7 @@ with tab2:
 
             results_data = []
             with st.spinner(f"正在并发验证 {len(records)} 条记录（3线程）..."):
-                all_results = verify_batch_concurrent(records, max_workers=3)
+                all_results = ve.verify_batch_concurrent(records, max_workers=3)
                 for ref, r in zip(records, all_results):
                     results_data.append({
                         "标题": ref.title, "作者": ref.authors,
@@ -119,7 +118,6 @@ with tab2:
             result_df = pd.DataFrame(results_data)
             st.success(f"验证完成！共 {len(result_df)} 条记录")
 
-            # 6档统计
             st.markdown("**6档分类统计：**")
             cols = st.columns(6)
             for i, status in enumerate(STATUS_ORDER):
@@ -149,8 +147,6 @@ with tab2:
 # ── Tab 3: 中文文献验证 ────────────────────────────────────────────
 
 with tab3:
-    from verify_engine import parse_references_batch
-
     st.markdown("#### 粘贴知网/万方引用格式，自动解析并验证")
     st.caption("支持格式：[1]作者.标题[J].期刊名,2022,(7):156-159.")
 
@@ -160,10 +156,10 @@ with tab3:
     )
 
     if st.button("解析并验证", type="primary", key="btn_cn", disabled=not raw_text.strip()):
-        parsed = parse_references_batch(raw_text)
+        parsed = ve.parse_references_batch(raw_text)
         records = []
         for p in parsed:
-            records.append(ReferenceRecord(
+            records.append(ve.ReferenceRecord(
                 title=p.get("title", "") or "", authors="", doi=None, year=p.get("year"),
             ))
 
@@ -172,7 +168,7 @@ with tab3:
         results_data = []
         with st.spinner(f"正在验证 {len(records)} 条..."):
             for i, rec in enumerate(records):
-                r = verify_record(rec)
+                r = ve.verify_record(rec)
                 results_data.append({
                     "序号": i + 1, "标题": rec.title, "年份": rec.year or "",
                     "状态": r.status, "可信度": r.score,
@@ -206,7 +202,6 @@ with tab4:
         if st.button("提取并验证", type="primary", key="btn_file"):
             records = []
 
-            # 确定文件类型
             fname = uploaded_file.name.lower()
             is_bib = fname.endswith(".bib") or file_type == "BibTeX"
             is_pdf = fname.endswith(".pdf") or file_type == "PDF"
@@ -217,14 +212,14 @@ with tab4:
                         text = file_bytes.decode("utf-8")
                     except UnicodeDecodeError:
                         text = file_bytes.decode("latin-1")
-                    records = extract_references_from_bibtex(text)
+                    records = ve.extract_references_from_bibtex(text)
                     st.info(f"从 BibTeX 提取出 {len(records)} 条文献")
                 elif is_pdf:
                     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                         tmp.write(file_bytes)
                         tmp_path = tmp.name
                     try:
-                        records = extract_references_from_pdf(tmp_path)
+                        records = ve.extract_references_from_pdf(tmp_path)
                         st.info(f"从 PDF 提取出 {len(records)} 条文献")
                     finally:
                         os.unlink(tmp_path)
@@ -234,7 +229,7 @@ with tab4:
             if records:
                 results_data = []
                 with st.spinner(f"正在级联验证 {len(records)} 条记录..."):
-                    all_results = verify_batch_concurrent(records, max_workers=3)
+                    all_results = ve.verify_batch_concurrent(records, max_workers=3)
                     for ref, r in zip(records, all_results):
                         results_data.append({
                             "标题": ref.title, "DOI": ref.doi or "",

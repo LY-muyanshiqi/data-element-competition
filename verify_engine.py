@@ -356,10 +356,10 @@ def _check_doi_validity(ref: ReferenceRecord, raw: dict, cascade_score: int) -> 
     if has_doi_match:
         return 5, "DOI已验证存在"
 
-    # DOI查不到：检查是否标题搜索找到了（可疑）
+    # DOI查不到：但如果任何标题搜索找到了（score>=15），可能是DOI格式变体
     has_title_match = cascade_score >= 15
     if has_title_match:
-        return -3, "DOI无记录但标题搜到相似文献（可能为嵌合体引用）"
+        return 0, "DOI无直接记录但标题匹配到文献（可能为DOI格式变体）"
 
     return -8, "DOI格式正确但所有数据源均无记录"
 
@@ -437,9 +437,16 @@ def _check_journal_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
             api_journal = api_journal or venue
 
         if api_journal:
-            sim = fuzz.token_sort_ratio(ref.journal.lower(), api_journal.lower()) / 100.0
+            sim_token = fuzz.token_sort_ratio(ref.journal.lower(), api_journal.lower()) / 100.0
+            sim_partial = fuzz.partial_ratio(ref.journal.lower(), api_journal.lower()) / 100.0
+            ref_words = set(ref.journal.lower().split())
+            api_words = set(api_journal.lower().split())
+            word_overlap = len(ref_words & api_words) / max(len(ref_words), 1)
+            sim = max(sim_token, sim_partial, word_overlap)
             if sim > 0.7:
                 return 5, f"期刊名匹配通过（相似度{sim:.2f}）"
+            elif sim > 0.4 and word_overlap > 0:
+                return 5, f"期刊名部分匹配（相似度{sim:.2f}，可能为缩写/全称变体）"
             else:
                 return 0, f"期刊名不匹配（输入「{ref.journal}」vs API「{api_journal[:40]}」）"
 

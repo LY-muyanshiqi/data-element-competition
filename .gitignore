@@ -9,3 +9,5 @@ screenshot*.jpg
 任务二/
 任务二_extracted/
 citation_cache.db
+.pytest_cache/
+.claude/

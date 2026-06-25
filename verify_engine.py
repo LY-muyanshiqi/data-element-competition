@@ -21,7 +21,7 @@ logger = logging.getLogger("verify_engine")
 CROSSREF_WORK_URL = "https://api.crossref.org/works/{doi}"
 OPENALEX_DOI_URL = "https://api.openalex.org/works/doi:{doi}"
 OPENALEX_TITLE_URL = "https://api.openalex.org/works?search={title}"
-SEMANTIC_SCHOLAR_DOI_URL = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+SEMANTIC_SCHOLAR_DOI_URL = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=title,authors,year,journal"
 SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search?query={title}&limit=5"
 
 DOI_REGEX = re.compile(r"10\.\d{4,}/[^\s]+")
@@ -119,10 +119,13 @@ def _try_crossref_doi(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
 
     cached = _cached_api_call(f"cr_doi_{ref.doi.strip()}", _lookup)
     if "title" in cached:
-        # 检查元数据一致性以给予更高分
+        # 检查title是否实际有效（不是空列表/空字符串）
         cr_title = cached.get("title", "")
-        if isinstance(cr_title, list) and cr_title:
-            cr_title = cr_title[0]
+        if isinstance(cr_title, list):
+            cr_title = cr_title[0] if cr_title else ""
+        if not cr_title:
+            # CrossRef 返回了DOI记录但没title，可能是不完整记录，不认为是成功匹配
+            return None
         title_sim = _title_similarity(ref.title, cr_title) if cr_title else 0
         if title_sim > 0.9:
             return 35, "CrossRef DOI匹配成功（标题高度一致）", {"crossref": cached}
@@ -230,7 +233,7 @@ def _try_openalex_title(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
 
 def _try_semantic_scholar(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
     """尝试 Semantic Scholar（DOI + 标题搜索）"""
-    raw = {"backend": "semantic_scholar"}
+    raw = {"backend": "semantic_scholar_doi"}  # 先尝试DOI
 
     # DOI 查询
     if ref.doi:
@@ -241,8 +244,8 @@ def _try_semantic_scholar(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
                 ss_title = data.get("title", "")
                 sim = _title_similarity(ref.title, ss_title) if ss_title else 0
                 raw["title"] = ss_title
-                raw["authors"] = data.get("authors", [])
-                raw["venue"] = _safe_get(data, "journal", "name", default="")
+                raw["author"] = [{"name": a.get("name", "")} for a in data.get("authors", [])]
+                raw["venue"] = _safe_get(data, "journal", "name", default="") or ""
                 if sim > 0.9:
                     return 15, "Semantic Scholar DOI确认存在", {"semantic_scholar": raw}
                 elif sim > 0.7:
@@ -251,7 +254,8 @@ def _try_semantic_scholar(ref: ReferenceRecord) -> tuple[int, str, dict] | None:
         except requests.RequestException:
             pass
 
-    # 标题搜索
+    # 标题搜索（DOI没命中才走到这里）
+    raw = {"backend": "semantic_scholar_title"}
     try:
         resp = requests.get(
             SEMANTIC_SCHOLAR_SEARCH_URL.format(title=requests.utils.quote(ref.title)),

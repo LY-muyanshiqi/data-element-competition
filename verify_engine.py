@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 from difflib import SequenceMatcher
@@ -67,6 +68,27 @@ def _safe_get(obj: dict, *keys, default=None):
     return obj
 
 
+# ── 内存缓存 ──────────────────────────────────────────────────────────
+
+_doi_cache: dict[str, dict] = {}
+
+
+def _cached_api_call(key: str, fetcher, ttl: int = 3600):
+    """带缓存的API调用，key为缓存键，fetcher为实际请求函数"""
+    now = time.time()
+    if key in _doi_cache and now - _doi_cache[key].get("_ts", 0) < ttl:
+        return _doi_cache[key]
+    result = fetcher()
+    result["_ts"] = now
+    _doi_cache[key] = result
+    return result
+
+
+def clear_cache():
+    """清空缓存"""
+    _doi_cache.clear()
+
+
 # ── dimensions ──────────────────────────────────────────────────────
 
 def _check_doi_format(doi: Optional[str]) -> tuple[int, str]:
@@ -87,31 +109,36 @@ def _check_year(year: Optional[int]) -> tuple[int, str]:
 
 def _check_crossref(ref: ReferenceRecord) -> tuple[int, str, dict]:
     raw = {}
-    # 1) DOI 精确匹配
+    # 1) DOI 精确匹配（带缓存）
     if ref.doi:
-        try:
-            resp = requests.get(
-                CROSSREF_WORK_URL.format(doi=ref.doi.strip()),
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                msg = data.get("message", {})
-                raw["crossref"] = {
-                    "source": "doi",
-                    "title": msg.get("title"),
-                    "doi": msg.get("DOI"),
-                    "author": msg.get("author", []),
-                    "container-title": msg.get("container-title", []),
-                }
-                return 30, "CrossRef DOI匹配成功", raw
-            elif resp.status_code == 404:
-                raw["crossref"] = {"source": "doi", "error": "DOI未找到"}
-            else:
-                raw["crossref"] = {"source": "doi", "error": f"HTTP {resp.status_code}"}
-        except requests.RequestException as e:
-            raw["crossref"] = {"source": "doi", "error": str(e)}
-            logger.warning("CrossRef DOI请求失败: %s", e)
+        def _doi_lookup():
+            try:
+                resp = requests.get(
+                    CROSSREF_WORK_URL.format(doi=ref.doi.strip()),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    msg = data.get("message", {})
+                    return {
+                        "source": "doi",
+                        "title": msg.get("title"),
+                        "doi": msg.get("DOI"),
+                        "author": msg.get("author", []),
+                        "container-title": msg.get("container-title", []),
+                    }
+                elif resp.status_code == 404:
+                    return {"source": "doi", "error": "DOI未找到"}
+                else:
+                    return {"source": "doi", "error": f"HTTP {resp.status_code}"}
+            except requests.RequestException as e:
+                return {"source": "doi", "error": str(e)}
+
+        key = f"cr_doi_{ref.doi.strip()}"
+        cached = _cached_api_call(key, _doi_lookup)
+        raw["crossref"] = cached
+        if "title" in cached and cached.get("source") == "doi":
+            return 30, "CrossRef DOI匹配成功", raw
 
     # 2) 标题搜索
     try:
@@ -147,19 +174,34 @@ def _check_crossref(ref: ReferenceRecord) -> tuple[int, str, dict]:
 def _check_openalex(ref: ReferenceRecord) -> tuple[int, str, dict]:
     raw = {}
     if ref.doi:
-        try:
-            resp = requests.get(
-                OPENALEX_DOI_URL.format(doi=ref.doi.strip()),
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                raw["openalex"] = {"source": "doi", "title": data.get("title"), "doi": data.get("doi")}
-                return _openalex_confirm(data, ref, raw)
-            elif resp.status_code == 404:
-                raw["openalex"] = {"source": "doi", "error": "DOI未找到"}
-        except requests.RequestException as e:
-            raw["openalex"] = {"source": "doi", "error": str(e)}
+        def _oa_doi_lookup():
+            try:
+                resp = requests.get(
+                    OPENALEX_DOI_URL.format(doi=ref.doi.strip()),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return {
+                        "source": "doi",
+                        "title": data.get("title"),
+                        "doi": data.get("doi"),
+                        "author": data.get("authorships", []),
+                        "publication_year": data.get("publication_year"),
+                    }
+                elif resp.status_code == 404:
+                    return {"source": "doi", "error": "DOI未找到"}
+                else:
+                    return {"source": "doi", "error": f"HTTP {resp.status_code}"}
+            except requests.RequestException as e:
+                return {"source": "doi", "error": str(e)}
+
+        key = f"oa_doi_{ref.doi.strip()}"
+        cached = _cached_api_call(key, _oa_doi_lookup)
+        if "title" in cached and cached.get("source") == "doi":
+            raw["openalex"] = cached
+            return _openalex_confirm(cached, ref, raw)
+        raw["openalex"] = cached
 
     # 标题搜索
     try:
@@ -226,16 +268,25 @@ def _check_author_match(ref: ReferenceRecord, raw: dict) -> tuple[int, str]:
         api_data = raw.get(api_key, {})
         api_authors_raw = api_data.get("author", [])
         if not api_authors_raw:
+            # OpenAlex 可能用 authorships
+            api_authors_raw = api_data.get("authorships", [])
+        if not api_authors_raw:
             continue
 
         api_author_names = set()
         for a in api_authors_raw:
+            # CrossRef: family/given; OpenAlex: author.display_name
             family = (a.get("family") or a.get("last") or "").lower()
             given = (a.get("given") or a.get("first") or "").lower()
+            display = ""
+            if isinstance(a.get("author"), dict):
+                display = a["author"].get("display_name", "").lower()
             if family:
                 api_author_names.add(family)
             if given:
                 api_author_names.add(given)
+            if display:
+                api_author_names.add(display)
 
         if not api_author_names:
             continue
@@ -344,8 +395,6 @@ def verify_record(ref: ReferenceRecord) -> VerificationResult:
     details.append(f"[CrossRef] {d} (+{s})")
     raw.update(c_r)
 
-    time.sleep(0.5)  # rate limit
-
     # 维度4: OpenAlex (25分)
     s, d, o_r = _check_openalex(ref)
     total += s
@@ -390,6 +439,23 @@ def verify_batch(records: list[ReferenceRecord]) -> list[VerificationResult]:
         results.append(verify_record(ref))
         if i < len(records) - 1:
             time.sleep(1)  # 1 req/s
+    return results
+
+
+def verify_batch_concurrent(records: list[ReferenceRecord], max_workers: int = 3) -> list[VerificationResult]:
+    """并发批量验证，max_workers=3 控制API请求频率"""
+    results = [None] * len(records)
+
+    def _verify_one(idx: int, ref: ReferenceRecord):
+        logger.info("验证 %d/%d: %s", idx + 1, len(records), ref.title[:60])
+        return idx, verify_record(ref)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_verify_one, i, ref): i for i, ref in enumerate(records)}
+        for future in as_completed(futures):
+            idx, result = future.result()
+            results[idx] = result
+
     return results
 
 

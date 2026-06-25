@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-from verify_engine import ReferenceRecord, verify_record, verify_batch
+from verify_engine import ReferenceRecord, verify_record, verify_batch, verify_batch_concurrent
 
 st.set_page_config(page_title="文献真实性验证", page_icon="📚", layout="wide")
 st.title("📚 学术文献真实性验证工具")
@@ -98,24 +98,23 @@ with tab2:
             status_text = st.empty()
 
             results_data = []
-            for i, ref in enumerate(records):
-                status_text.text(f"正在验证 {i + 1}/{len(records)}: {ref.title[:50]}...")
-                r = verify_record(ref)
-                results_data.append(
-                    {
-                        "标题": ref.title,
-                        "作者": ref.authors,
-                        "期刊": ref.journal or "",
-                        "DOI": ref.doi or "",
-                        "输入年份": ref.year or "",
-                        "状态": r.status,
-                        "可信度": r.score,
-                        "验证详情": "\n".join(r.details),
-                    }
-                )
-                progress_bar.progress((i + 1) / len(records))
-                if i < len(records) - 1:
-                    time.sleep(1)
+            with st.spinner(f"正在并发验证 {len(records)} 条记录..."):
+                status_text.text(f"并发验证中（3线程）...")
+                all_results = verify_batch_concurrent(records, max_workers=3)
+                for ref, r in zip(records, all_results):
+                    results_data.append(
+                        {
+                            "标题": ref.title,
+                            "作者": ref.authors,
+                            "期刊": ref.journal or "",
+                            "DOI": ref.doi or "",
+                            "输入年份": ref.year or "",
+                            "状态": r.status,
+                            "可信度": r.score,
+                            "验证详情": "\n".join(r.details),
+                        }
+                    )
+            progress_bar.progress(1.0)
 
             result_df = pd.DataFrame(results_data)
             st.success(f"验证完成！共 {len(result_df)} 条记录")

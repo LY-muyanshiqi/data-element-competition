@@ -17,6 +17,21 @@ st.set_page_config(page_title="文献真实性验证", page_icon="📚", layout=
 st.title("📚 学术文献真实性验证工具 v3")
 st.caption("基于 CrossRef / OpenAlex / Semantic Scholar 公开 API + 级联验证引擎，自动识别 AI 生成的虚假文献")
 
+# 侧边栏设置
+with st.sidebar:
+    st.markdown("### ⚙️ 设置")
+    offline = st.checkbox("离线模式", value=False, help="仅使用本地缓存，不发起网络请求")
+    if offline:
+        ve.set_offline_mode(True)
+        st.warning("已启用离线模式：仅使用本地缓存验证")
+    else:
+        ve.set_offline_mode(False)
+
+    st.divider()
+    st.markdown("### 📊 缓存状态")
+    cache_count = len(ve._doi_cache)
+    st.metric("内存缓存条目", cache_count)
+
 # 6档分类颜色映射
 COLOR_MAP = {
     "确定真实": "green",
@@ -39,7 +54,7 @@ STATUS_DISPLAY = {
 
 # ── Tab 1: 单篇验证 ────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔍 单篇验证", "📂 批量验证", "📄 中文文献验证", "📁 文件导入"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 单篇验证", "📂 批量验证", "📄 中文文献验证", "📁 文件导入", "🧪 自检测试"])
 
 with tab1:
     col1, col2 = st.columns(2)
@@ -275,3 +290,38 @@ with tab4:
 
                 csv = result_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button("📥 导出结果 (CSV)", csv, "file_import_results.csv", "text/csv")
+
+# ── Tab 5: 自检测试 ──────────────────────────────────────────────
+
+with tab5:
+    st.markdown("#### 工具自检测试")
+    st.caption("用内置 9 条已知标签文献（6真3假）验证工具准确性")
+
+    if st.button("🚀 运行自检", type="primary", key="btn_selftest"):
+        with st.spinner("正在运行自检（含API验证，约需 30 秒）..."):
+            report = ve.run_self_test("data/demo_data.csv")
+
+        st.success(f"自检完成！共 {report['total']} 条文献（{report['real_total']}真 + {report['fake_total']}假）")
+
+        # 指标卡片
+        col1, col2, col3 = st.columns(3)
+        col1.metric("📊 真文献平均分", f"{report['avg_real_score']:.0f}")
+        col2.metric("📊 假文献平均分", f"{report['avg_fake_score']:.0f}")
+        col3.metric("🎯 真假分差", f"{report['score_gap']:.0f}",
+                    help="分差越大说明区分度越好")
+
+        st.divider()
+
+        # 得分对比柱状图
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        real_scores = report['real_scores']
+        fake_scores = report['fake_scores']
+        for i, s in enumerate(real_scores):
+            fig.add_trace(go.Bar(name=f"真#{i+1}", x=["真实文献"], y=[s], marker_color="#28a745",
+                                  text=f"{s}", textposition="auto"))
+        for i, s in enumerate(fake_scores):
+            fig.add_trace(go.Bar(name=f"假#{i+1}", x=["虚假文献"], y=[s], marker_color="#dc3545",
+                                  text=f"{s}", textposition="auto"))
+        fig.update_layout(barmode="group", title="真/假文献可信度对比", height=400)
+        st.plotly_chart(fig, use_container_width=True)

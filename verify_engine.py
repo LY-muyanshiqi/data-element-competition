@@ -64,18 +64,76 @@ def _safe_get(obj: dict, *keys, default=None):
     return obj
 
 
-# ── 内存缓存 ──────────────────────────────────────────────────────────
+# ── 内存缓存 + SQLite 持久化 ──────────────────────────────────────────
 
 _doi_cache: dict[str, dict] = {}
+_offline_mode = False
+_sqlite_conn = None
+
+
+def set_offline_mode(enabled: bool):
+    """开启/关闭离线模式"""
+    global _offline_mode
+    _offline_mode = enabled
+    if enabled:
+        _init_sqlite()
+
+
+def _get_sqlite():
+    global _sqlite_conn
+    if _sqlite_conn is None:
+        import sqlite3 as _sqlite3
+        _sqlite_conn = _sqlite3.connect("citation_cache.db")
+        _sqlite_conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, data TEXT, ts REAL)")
+        _sqlite_conn.commit()
+    return _sqlite_conn
+
+
+def _init_sqlite():
+    _get_sqlite()
 
 
 def _cached_api_call(key: str, fetcher, ttl: int = 3600):
     now = time.time()
+    # 1. 内存缓存
     if key in _doi_cache and now - _doi_cache[key].get("_ts", 0) < ttl:
         return _doi_cache[key]
-    result = fetcher()
+
+    # 2. SQLite 持久化缓存
+    try:
+        import json as _json
+        db = _get_sqlite()
+        row = db.execute("SELECT data, ts FROM cache WHERE key=?", (key,)).fetchone()
+        if row and now - row[1] < ttl:
+            data = _json.loads(row[0])
+            _doi_cache[key] = data
+            return data
+    except Exception:
+        pass
+
+    # 3. 离线模式 — 不发请求
+    if _offline_mode:
+        return {"error": "离线模式", "_ts": now}
+
+    # 4. 网络请求
+    try:
+        result = fetcher()
+    except Exception as e:
+        logger.warning("API请求失败: %s", e)
+        return {"error": str(e), "_ts": now}
+
     result["_ts"] = now
     _doi_cache[key] = result
+
+    # 持久化
+    try:
+        import json as _json
+        db = _get_sqlite()
+        db.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)", (key, _json.dumps(result, default=str), now))
+        db.commit()
+    except Exception:
+        pass
+
     return result
 
 
@@ -481,6 +539,9 @@ _AI_FINGERPRINT_PATTERNS = [
     (re.compile(r'\bcomprehensive\s+(review|survey|analysis|study)\s+of\b', re.IGNORECASE), "comprehensive review of 模式"),
     (re.compile(r'\bin\s+(the\s+)?linear\s+time\b', re.IGNORECASE), "声称线性时间复杂度"),
     (re.compile(r'\bstate[ -]of[ -]the[ -]art\b', re.IGNORECASE), "state-of-the-art 模板词"),
+    (re.compile(r'\b(unprecedented|groundbreaking|revolutionary|paradigm.shift)\b', re.IGNORECASE), "过度夸张词汇（unprecedented/groundbreaking等）"),
+    (re.compile(r'\b\d{2,3}\.?\d*%\s*(improvement|increase|reduction|boost|gain)\b', re.IGNORECASE), "精确百分比声称（XX% improvement）"),
+    (re.compile(r'\b(without\s+any|requires\s+no|zero\s+additional)\b', re.IGNORECASE), "绝对化声明（without any/requires no）"),
 ]
 
 
@@ -947,3 +1008,42 @@ def generate_pdf_report(results: list[VerificationResult], records: list[Referen
 
     doc.build(elements)
     return output_path
+
+
+# ── 自测试套件 ───────────────────────────────────────────────────────
+
+def run_self_test(csv_path: str = "data/demo_data.csv") -> dict:
+    """规则层自检：仅检查格式/语义/AI特征（不依赖网络），对比真假文献得分"""
+    import pandas as _pd
+
+    df = _pd.read_csv(csv_path)
+    expected_real = list(range(6))
+    expected_fake = list(range(6, min(9, len(df))))
+
+    results = []
+    for _, row in df.iterrows():
+        ref = ReferenceRecord(
+            title=str(row.get("title", "")),
+            authors=str(row.get("authors", "")),
+            doi=str(row.get("doi", "")) if _pd.notna(row.get("doi")) else None,
+            year=int(row["year"]) if _pd.notna(row.get("year")) else None,
+        )
+        r = verify_record(ref)
+        results.append(r)
+
+    real_scores = [results[i].score for i in expected_real]
+    fake_scores = [results[i].score for i in expected_fake]
+    avg_real = sum(real_scores) / len(real_scores) if real_scores else 0
+    avg_fake = sum(fake_scores) / len(fake_scores) if fake_scores else 0
+
+    return {
+        "total": len(df),
+        "real_total": len(expected_real),
+        "fake_total": len(expected_fake),
+        "avg_real_score": avg_real,
+        "avg_fake_score": avg_fake,
+        "score_gap": avg_real - avg_fake,
+        "real_scores": real_scores,
+        "fake_scores": fake_scores,
+        "results": results,
+    }
